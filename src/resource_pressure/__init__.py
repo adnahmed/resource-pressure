@@ -6,7 +6,7 @@ from .model import (
     PressureError, PressureEvent, PressureLevel,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __all__ = [
     "BackendUnavailable", "ContainmentUnavailable", "GovernorClosed", "Lease",
     "MonitorFailed", "PSIConfig", "PressureError", "PressureEvent", "PressureGovernor",

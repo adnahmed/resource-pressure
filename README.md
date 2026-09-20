@@ -7,7 +7,10 @@ No `psutil`, RAM percentages, free-memory reserves, per-worker memory estimates,
 or adaptive thread-pool algorithm. No GLib, PyGObject, MSYS2, or compiler is
 needed for the core wheel.
 
-**Version 0.1.1 is an alpha implementation, not a production-validated release.**
+The working tree is `0.1.2`. Its `DaskProducer` API is available from a
+source installation and has not been published.
+
+**Version 0.1.2 is an alpha implementation, not a production-validated release.**
 See `docs/TEST_REPORT.md` for what actually ran and what remains unverified.
 
 ## Install
@@ -237,6 +240,46 @@ if __name__ == "__main__":
 input lookahead, drains completed results even while pressure blocks new work,
 and releases futures as results are consumed. Closing the iterator
 cancels/releases remaining futures and leases.
+
+### Producer ownership and durable preparation
+
+`DaskProducer` accepts an existing submission callback and owns pending futures,
+their application metadata, admission leases, and cleanup. It forwards callback
+arguments unchanged. When using `client.submit` directly, pass `pure=False` for
+independent operations that must not share a Dask task key.
+
+```python
+from resource_pressure.integrations.dask import DaskProducer
+
+with DaskProducer(submit_task, governor, drain=drain_tasks) as pending:
+    with pending.reserve() as reservation:
+        if reservation is not None:
+            job = claim_next_job()  # Claim only after capacity is reserved.
+            if job is not None:
+                reservation.submit(work, job, metadata=job.identity)
+
+    for future, identity in pending.completed(timeout=0.2):
+        persist_result(identity, future.result())
+```
+
+Unused reservations release on scope exit. Successful submissions stay owned
+through the completion loop body. The producer is a mapping of raw futures to
+application metadata; `update_metadata()` replaces that metadata without
+disturbing ownership. `try_submit()` combines reservation and submission and
+returns `None` when admission is unavailable. `admit=False` keeps control work
+outside the pressure gate while still owning its result cleanup.
+
+`refill(work, select, on_submit=selected)` repeatedly calls `select(count)`,
+retains selected inputs across admission pauses, and yields `(future, item)`
+through consumption. `selected(item)` runs only after submission succeeds.
+Selection errors are raised after accepted results drain. Supply a `stop_event`
+for cooperative shutdown and `max_pending` for a producer's existing queue bound.
+
+Use one completion consumer per producer; submissions may come from other
+threads. Closing stops acceptance, calls the supplied `drain(futures)` callback,
+and releases remaining ownership. That callback must wait for running business
+work and its cleanup; closing does not cancel running work. Domain eligibility,
+durable claims, publication, and retry policy remain in the application.
 
 ### Custom producer loops: do not block the drain path
 
