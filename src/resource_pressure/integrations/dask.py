@@ -9,7 +9,10 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from collections.abc import Callable, Iterable, Iterator
+import time
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from typing import Any, TypeVar
 
 from ..governor import Lease, PressureGovernor
@@ -18,7 +21,7 @@ T = TypeVar("T")
 R = TypeVar("R")
 log = logging.getLogger(__name__)
 
-__all__ = ["DaskAdmission", "ManagedSubmission"]
+__all__ = ["DaskAdmission", "DaskProducer", "ManagedSubmission"]
 
 
 def _discard(future: Any, *, cancel: bool) -> None:
@@ -47,7 +50,7 @@ class ManagedSubmission:
     ``cancel()`` during cleanup. Both methods are idempotent.
     """
 
-    def __init__(self, future: Any, lease: Lease):
+    def __init__(self, future: Any, lease: Lease | None):
         self.future = future
         self._lease = lease
         self._released = False
@@ -64,7 +67,8 @@ class ManagedSubmission:
         try:
             _discard(self.future, cancel=False)
         finally:
-            self._lease.release()
+            if self._lease is not None:
+                self._lease.release()
 
     def cancel(self) -> None:
         with self._lock:
@@ -74,13 +78,224 @@ class ManagedSubmission:
         try:
             _discard(self.future, cancel=True)
         finally:
-            self._lease.release()
+            if self._lease is not None:
+                self._lease.release()
 
     def __enter__(self) -> ManagedSubmission:
         return self
 
     def __exit__(self, *args: Any) -> None:
         self.release()
+
+
+class _Reservation:
+    def __init__(self, producer: DaskProducer, lease: Lease | None):
+        self.producer, self.lease = producer, lease
+        self.used = False
+
+    def submit(self, function: Callable[..., Any], *args: Any,
+               metadata: Any = None, **kwargs: Any) -> Any:
+        return self.producer._submit_reserved(self, function, args, metadata, kwargs)
+
+
+class DaskProducer(Mapping[Any, Any]):
+    """Own pending futures, metadata and admission through result consumption.
+
+    ``drain(futures)`` must wait for physical business cleanup; logical Future
+    cancellation is insufficient. Closing stops admission, drains, then releases
+    every owned Future without cancelling running work. ``admit=False`` supports
+    coordination work that must not hold a business admission slot.
+    Submissions may be concurrent; completion consumption and closing must have
+    one owner. The submit callable must return distinct pending Futures and owns
+    scheduler options (for example, pass ``pure=False`` with Client.submit).
+    """
+
+    def __init__(self, submit: Callable[..., Any], governor: PressureGovernor, *,
+                 drain: Callable[[Iterable[Any]], None],
+                 stop_event: threading.Event | None = None, max_pending: int | None = None):
+        if max_pending is not None and (
+            isinstance(max_pending, bool) or not isinstance(max_pending, int) or max_pending < 1
+        ):
+            raise ValueError("max_pending must be a positive integer or None")
+        self.governor, self.max_pending = governor, max_pending
+        self._submit, self._drain = submit, drain
+        self._stop = stop_event if stop_event is not None else threading.Event()
+        self._lock = threading.RLock()
+        self._pending: dict[Any, tuple[ManagedSubmission, Any]] = {}
+        self._reservations: set[_Reservation] = set()
+        self._ready: queue.Queue[Any] = queue.Queue()
+        self._closed = False
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    def __iter__(self) -> Iterator[Any]:
+        with self._lock:
+            return iter(tuple(self._pending))
+
+    def __getitem__(self, future: Any) -> Any:
+        with self._lock:
+            return self._pending[future][1]
+
+    def items(self):
+        with self._lock:
+            return tuple((future, entry[1]) for future, entry in self._pending.items())
+
+    def values(self):
+        with self._lock:
+            return tuple(entry[1] for entry in self._pending.values())
+
+    def update_metadata(self, future: Any, metadata: Any) -> None:
+        with self._lock:
+            self._pending[future] = (self._pending[future][0], metadata)
+
+    def _stopped(self) -> bool:
+        return self._closed or self._stop.is_set()
+
+    def _release_reservation(self, reservation: _Reservation) -> None:
+        with self._lock:
+            if reservation not in self._reservations:
+                return
+            self._reservations.remove(reservation)
+        if reservation.lease is not None:
+            reservation.lease.release()
+
+    @contextmanager
+    def reserve(self, *, admit: bool = True) -> Iterator[_Reservation | None]:
+        reservation = None
+        with self._lock:
+            available = self.max_pending is None or (
+                len(self._pending) + len(self._reservations) < self.max_pending
+            )
+            if not self._stopped() and available:
+                lease = self.governor.try_acquire() if admit else None
+                if not admit or lease is not None:
+                    reservation = _Reservation(self, lease)
+                    self._reservations.add(reservation)
+        try:
+            yield reservation
+        finally:
+            if reservation is not None:
+                self._release_reservation(reservation)
+
+    def _submit_reserved(self, reservation: _Reservation, function: Callable[..., Any],
+                         args: tuple[Any, ...], metadata: Any, kwargs: dict[str, Any]) -> Any:
+        with self._lock:
+            if self._stopped() or reservation.used or reservation not in self._reservations:
+                raise RuntimeError("Reservation is closed or already submitted")
+            reservation.used = True
+            future = self._submit(function, *args, **kwargs)
+            if future in self._pending:
+                raise ValueError("submit must return distinct pending Futures")
+            self._pending[future] = (ManagedSubmission(future, reservation.lease), metadata)
+            self._reservations.remove(reservation)
+            future.add_done_callback(self._ready.put)
+            return future
+
+    def try_submit(self, function: Callable[..., Any], *args: Any, metadata: Any = None,
+                   admit: bool = True, **kwargs: Any) -> Any | None:
+        with self.reserve(admit=admit) as reservation:
+            return None if reservation is None else reservation.submit(
+                function, *args, metadata=metadata, **kwargs
+            )
+
+    def _release(self, future: Any) -> None:
+        with self._lock:
+            entry = self._pending.pop(future, None)
+        if entry is not None:
+            entry[0].release()
+
+    def completed(self, *, timeout: float = 0.0) -> Iterator[tuple[Any, Any]]:
+        """Wait for a completion, then drain ready results; hold leases across yield."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                future = self._ready.get(timeout=max(0.0, min(0.2, deadline - time.monotonic())))
+            except queue.Empty:
+                if self._stopped():
+                    return
+                self.governor.check_health()
+                if time.monotonic() >= deadline:
+                    return
+                continue
+            with self._lock:
+                entry = self._pending.get(future)
+            if entry is not None:
+                try:
+                    yield future, entry[1]
+                finally:
+                    self._release(future)
+                deadline = 0.0
+
+    def refill(self, function: Callable[[T], R], select: Callable[[int], Iterable[T]], *,
+               on_submit: Callable[[T], None] | None = None, **kwargs: Any
+               ) -> Iterator[tuple[Any, T]]:
+        """Select bounded batches, retaining denied candidates until admission resumes.
+
+        ``select(count)`` returns at most count candidates. Empty selection is
+        temporary while work is pending. Selection errors propagate after already
+        accepted results have been yielded; ``on_submit(item)`` runs only on acceptance.
+        """
+        candidates: deque[T] = deque()
+        error: Exception | None = None
+        limit = self.max_pending or self.governor.max_in_flight
+        while True:
+            if self._stopped():
+                return
+            if error is None:
+                try:
+                    capacity = limit - len(self)
+                    if capacity > 0 and not candidates:
+                        candidates.extend(select(capacity))
+                    while candidates and len(self) < limit:
+                        item = candidates[0]
+                        if self.try_submit(function, item, metadata=item, **kwargs) is None:
+                            break
+                        candidates.popleft()
+                        if on_submit is not None:
+                            on_submit(item)
+                except Exception as exc:
+                    error = exc
+            if self:
+                for completed in self.completed(timeout=0.2):
+                    if self._stopped():
+                        return
+                    yield completed
+            elif error is not None:
+                raise error
+            elif not candidates:
+                return
+            else:
+                self.governor.check_health()
+                self._stop.wait(0.2)
+
+    def drain(self) -> None:
+        self._drain(tuple(self))
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            self.drain()
+        finally:
+            with self._lock:
+                reservations = tuple(self._reservations)
+            for items, release in ((reservations, self._release_reservation),
+                                   (tuple(self), self._release)):
+                for item in items:
+                    try:
+                        release(item)
+                    except BaseException:
+                        log.exception("Could not release producer ownership during cleanup")
+
+    def __enter__(self) -> DaskProducer:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
 
 
 class DaskAdmission:
