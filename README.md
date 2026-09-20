@@ -14,6 +14,26 @@ See `docs/TEST_REPORT.md` for what actually ran and what remains unverified.
 
 ## Install
 
+Core:
+
+```bash
+pip install resource-pressure
+```
+or:
+```bash
+uv add resource-pressure
+```
+With Dask + process containment:
+
+```bash
+pip install "resource-pressure[all]"
+```
+or:
+
+```bash
+uv add "resource-pressure[all]"
+```
+
 After extracting the archive, from its parent directory:
 
 ```bash
@@ -46,10 +66,12 @@ and platform restrictions still apply. The `dask` extra installs `distributed`.
 import asyncio
 from resource_pressure import PressureGovernor
 
+
 async def main():
     async with PressureGovernor.auto(max_in_flight=4) as governor:
         async with governor.slot():
             await perform_one_heavy_operation()
+
 
 # asyncio.run(main())  # Define your own perform_one_heavy_operation first.
 ```
@@ -135,8 +157,9 @@ eliminated. It is explicit and configurable:
 from resource_pressure import PSIConfig, PressureGovernor
 
 governor = PressureGovernor.auto(
-    psi=PSIConfig(some_stall_us=150_000, full_stall_us=50_000,
-                  window_us=2_000_000, quiet_seconds=4.0)
+    psi=PSIConfig(
+        some_stall_us=150_000, full_stall_us=50_000, window_us=2_000_000, quiet_seconds=4.0
+    )
 )
 ```
 
@@ -144,10 +167,12 @@ Default scope is `/proc/pressure/memory` only. To monitor a deployment-provided
 cgroup and the host, explicitly supply both paths:
 
 ```python
-governor = PressureGovernor.auto(psi_paths=[
-    "/proc/pressure/memory",
-    "/sys/fs/cgroup/YOUR_DELEGATED_GROUP/memory.pressure",
-])
+governor = PressureGovernor.auto(
+    psi_paths=[
+        "/proc/pressure/memory",
+        "/sys/fs/cgroup/YOUR_DELEGATED_GROUP/memory.pressure",
+    ]
+)
 ```
 
 All requested paths must support writable PSI triggers. Merely reading PSI
@@ -294,9 +319,7 @@ state, and closes it. It does not claim to test containment or induce pressure.
 Missing/failed native support exits with code 2, not a fake NORMAL status.
 
 ```python
-unsubscribe = governor.subscribe(
-    lambda event: print(event.level.name, event.backend, event.reason)
-)
+unsubscribe = governor.subscribe(lambda event: print(event.level.name, event.backend, event.reason))
 # Later: unsubscribe()
 ```
 
