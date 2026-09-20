@@ -1,7 +1,7 @@
-........................................................................ [ 77%]
-....................s                                                    [100%]
+........................................................................ [ 68%]
+................................s                                        [100%]
 =========================== short test summary info ============================
 SKIPPED [1] tests/test_real_dask.py:4: could not import 'distributed': No module named 'distributed'
 SKIPPED [1] tests/test_real_processkit.py:5: could not import 'processkit': No module named 'processkit'
 SKIPPED [1] tests/test_native.py:9: Set RESOURCE_PRESSURE_NATIVE=1 on a supported native host
-92 passed, 3 skipped in 2.49s
+104 passed, 3 skipped in 2.90s

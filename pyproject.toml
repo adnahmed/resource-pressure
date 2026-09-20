@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "resource-pressure"
-version = "0.1.0"
+version = "0.1.1"
 description = "Native memory-pressure signals, bounded admission, and optional kernel-backed process containment"
 readme = "README.md"
 requires-python = ">=3.10"

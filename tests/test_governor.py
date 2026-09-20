@@ -258,3 +258,53 @@ def test_many_async_waiters_stay_bounded():
             assert governor.in_flight == 0
             assert not governor._async_waiters
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("interval", [-1, float("inf"), float("nan"), True, "0.1"])
+def test_invalid_admission_interval(interval):
+    with pytest.raises(ValueError):
+        PressureGovernor(ManualBackend(), min_admission_interval=interval)
+
+
+def test_admission_pacing_limits_immediate_burst():
+    with PressureGovernor(
+        ManualBackend(), max_in_flight=3, min_admission_interval=0.04
+    ) as governor:
+        first = governor.try_acquire()
+        assert first is not None
+        first.release()
+        assert governor.try_acquire() is None
+        time.sleep(0.05)
+        second = governor.try_acquire()
+        assert second is not None
+        second.release()
+
+
+def test_blocking_acquire_wakes_when_pacing_interval_expires():
+    with PressureGovernor(
+        ManualBackend(), max_in_flight=2, min_admission_interval=0.03
+    ) as governor:
+        first = governor.acquire_sync()
+        first.release()
+        started = time.monotonic()
+        second = governor.acquire_sync(timeout=1)
+        elapsed = time.monotonic() - started
+        second.release()
+        assert elapsed >= 0.02
+
+
+def test_async_acquire_wakes_when_pacing_interval_expires():
+    async def run():
+        async with PressureGovernor(
+            ManualBackend(), max_in_flight=2, min_admission_interval=0.03
+        ) as governor:
+            first = await governor.acquire()
+            first.release()
+            started = time.monotonic()
+            second = await governor.acquire(timeout=1)
+            elapsed = time.monotonic() - started
+            second.release()
+            assert elapsed >= 0.02
+            assert not governor._async_waiters
+
+    asyncio.run(run())

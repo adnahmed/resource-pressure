@@ -104,14 +104,32 @@ class PressureGovernor:
     best-effort, not FIFO. Create a new governor in each spawned process.
     """
 
-    def __init__(self, backend: PressureBackend, *, max_in_flight: int | None = None):
+    def __init__(
+        self,
+        backend: PressureBackend,
+        *,
+        max_in_flight: int | None = None,
+        min_admission_interval: float = 0.0,
+    ):
         if max_in_flight is None:
             cpu_count = getattr(os, "process_cpu_count", os.cpu_count)
             max_in_flight = max(1, cpu_count() or 1)
-        if isinstance(max_in_flight, bool) or not isinstance(max_in_flight, int) or max_in_flight < 1:
+        if (
+            isinstance(max_in_flight, bool)
+            or not isinstance(max_in_flight, int)
+            or max_in_flight < 1
+        ):
             raise ValueError("max_in_flight must be a positive integer")
+        if (
+            isinstance(min_admission_interval, bool)
+            or not isinstance(min_admission_interval, (int, float))
+            or not math.isfinite(min_admission_interval)
+            or min_admission_interval < 0
+        ):
+            raise ValueError("min_admission_interval must be finite and non-negative")
         self.backend = backend
         self.max_in_flight = max_in_flight
+        self.min_admission_interval = float(min_admission_interval)
         self._pid = os.getpid()
         self._cv = threading.Condition()
         self._stop = threading.Event()
@@ -120,15 +138,32 @@ class PressureGovernor:
         self._closed = False
         self._error: BaseException | None = None
         self._in_flight = 0
+        self._last_admission_at: float | None = None
         self._event = PressureEvent(PressureLevel.UNKNOWN, backend.name, "not started")
         self._async_waiters: set[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = set()
         self._callbacks: set[Callable[[PressureEvent], None]] = set()
 
     @classmethod
-    def auto(cls, *, max_in_flight: int | None = None, psi: PSIConfig | None = None,
-             psi_paths: Sequence[str] | None = None) -> PressureGovernor:
-        """Select the OS backend. Start via with/async with or start()/astart()."""
-        return cls(auto_backend(psi=psi, psi_paths=psi_paths), max_in_flight=max_in_flight)
+    def auto(
+        cls,
+        *,
+        max_in_flight: int | None = None,
+        min_admission_interval: float = 0.0,
+        psi: PSIConfig | None = None,
+        psi_paths: Sequence[str] | None = None,
+    ) -> PressureGovernor:
+        """Select the OS backend. Start via with/async with or start()/astart().
+
+        ``min_admission_interval`` optionally paces new admissions. It is not a
+        memory estimate or adaptive worker-count algorithm; it simply limits how
+        quickly a large configured ceiling can be filled while native pressure
+        notification is still catching up with new allocations.
+        """
+        return cls(
+            auto_backend(psi=psi, psi_paths=psi_paths),
+            max_in_flight=max_in_flight,
+            min_admission_interval=min_admission_interval,
+        )
 
     def _check_pid(self) -> None:
         if os.getpid() != self._pid:
@@ -283,13 +318,41 @@ class PressureGovernor:
                 self._callbacks.discard(callback)
         return unsubscribe
 
+    def _pacing_delay_locked(self) -> float:
+        if self.min_admission_interval == 0.0 or self._last_admission_at is None:
+            return 0.0
+        return max(
+            0.0,
+            self._last_admission_at + self.min_admission_interval - time.monotonic(),
+        )
+
     def _can_admit(self, reserve: bool) -> bool:
-        return self._event.level == PressureLevel.NORMAL and (
-            not reserve or self._in_flight < self.max_in_flight)
+        if self._event.level != PressureLevel.NORMAL:
+            return False
+        if not reserve:
+            return True
+        return (
+            self._in_flight < self.max_in_flight
+            and self._pacing_delay_locked() == 0.0
+        )
 
     def _take_locked(self) -> Lease:
         self._in_flight += 1
+        self._last_admission_at = time.monotonic()
         return Lease(self)
+
+    def _next_wake_locked(self, reserve: bool, remaining: float | None) -> float | None:
+        """Return a condition/async wait timeout, accounting for admission pacing."""
+        wait_for = remaining
+        if (
+            reserve
+            and self._event.level == PressureLevel.NORMAL
+            and self._in_flight < self.max_in_flight
+        ):
+            pacing = self._pacing_delay_locked()
+            if pacing > 0.0:
+                wait_for = pacing if wait_for is None else min(wait_for, pacing)
+        return wait_for
 
     def try_acquire(self) -> Lease | None:
         """Atomically reserve a slot, or return None without waiting."""
@@ -309,7 +372,7 @@ class PressureGovernor:
                 remaining = _remaining(deadline)
                 if remaining == 0:
                     raise TimeoutError("Timed out waiting for memory-pressure admission")
-                self._cv.wait(remaining)
+                self._cv.wait(self._next_wake_locked(reserve, remaining))
 
     async def _wait_async(self, reserve: bool, timeout: float | None) -> Lease | None:
         self._check_pid()
@@ -323,14 +386,21 @@ class PressureGovernor:
                 remaining = _remaining(deadline)
                 if remaining == 0:
                     raise TimeoutError("Timed out waiting for memory-pressure admission")
+                wait_for = self._next_wake_locked(reserve, remaining)
                 future: asyncio.Future[None] = loop.create_future()
                 waiter = (loop, future)
                 self._async_waiters.add(waiter)
             try:
-                if remaining is None:
-                    await future
-                else:
-                    await asyncio.wait_for(future, remaining)
+                try:
+                    if wait_for is None:
+                        await future
+                    else:
+                        await asyncio.wait_for(future, wait_for)
+                except asyncio.TimeoutError:
+                    # A pacing timer can expire without an OS event or lease
+                    # release. Recheck state under the condition lock. The next
+                    # iteration enforces the caller's overall deadline.
+                    pass
             finally:
                 with self._cv:
                     self._async_waiters.discard(waiter)

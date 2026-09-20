@@ -1,74 +1,86 @@
-# Validation report — resource-pressure 0.1.0
+# Validation report — resource-pressure 0.1.1
 
-Prepared September 20, 2026. This is an alpha implementation, not a
+Prepared September 20, 2026. This remains an alpha implementation, not a
 production-ready or platform-certified release.
 
 ## Executed in this delivery environment
 
 Environment: Linux execution sandbox, CPython 3.13.5.
 
-```
+```text
 python -m pytest -q -ra
-92 passed, 3 skipped
+104 passed, 3 skipped
 ```
 
-The passing tests exercise real Python implementation code with deterministic
+The passing tests exercise the real Python implementation with deterministic
 native-interface or external-library doubles where necessary:
 
 - State transitions, existing-work preservation, bounded sync/async concurrency,
   timeout validation, cancellation, idempotent lease release, subscriber error
   isolation, explicit failure/close wakeup, and fork-reuse rejection.
-- Linux trigger formatting, separate fd ownership, real backend control flow
-  with simulated poll events, warmup/quiet-time policy, and partial registration
-  cleanup. Missing PSI is tested as an error rather than a fake NORMAL state.
+- New admission pacing validation, including non-blocking burst suppression and
+  sync/async wakeup when the configured minimum start interval expires.
+- Linux trigger formatting, separate fd ownership, backend control flow with
+  simulated poll events, warmup/quiet-time policy, and registration cleanup.
 - Windows low/high/neutral state mapping, alternating wait-handle selection, and
   partial handle cleanup through an injected API implementation.
 - macOS flag mapping, event dispatch to the governor, and source cleanup through
   an injected source implementation.
-- Dask public-API adapter behavior through Future/Client doubles: admission,
-  completion/cancellation release, bounded streaming, result draining while
-  pressured, end-of-input handling, iterator cleanup, and error paths.
-- processkit facade behavior through module doubles: requested limits,
-  mechanism validation, explicit POSIX fallback, no false hard-limit guarantee,
-  sync/async commands, pressure admission, and cleanup.
+- Dask adapter behavior through Future/Client doubles: blocking submission,
+  non-blocking `try_submit`, managed submission lifetime, completed-but-undrained
+  capacity retention, kwargs passthrough, cancellation/error cleanup, bounded
+  streaming, draining during pressure, end-of-input, and iterator cleanup.
+- processkit facade behavior through module doubles: requested limits, mechanism
+  validation, explicit POSIX fallback, sync/async commands, pressure admission,
+  and cleanup.
 - CLI success/error reporting.
 
-Also executed: syntax compilation of package/examples, the runnable injected-
-pressure demo, and an actual native `doctor` invocation. The native doctor
-correctly reports that `/proc/pressure/memory` is absent in this sandbox.
+Syntax compilation of package and example modules also passed.
 
-Packaging validation is recorded in `PACKAGING_REPORT.md` after the build.
+## Installed-wheel validation
+
+The locally built `resource_pressure-0.1.1-py3-none-any.whl` was installed into
+an isolated target with `pip --no-index --no-deps`.
+
+- Import/version smoke test passed (`resource_pressure.__version__ == "0.1.1"`).
+- Admission pacing smoke test passed from the installed wheel.
+- `ManagedSubmission` imported from the installed Dask integration module.
+- The full deterministic suite was rerun against the installed wheel with the
+  source-tree pythonpath disabled: **104 passed, 3 skipped**.
 
 ## Not executed here
 
-1. Real Windows kernel notification and Job Object behavior. There is no Windows
-   kernel in this environment. ctypes ABI correctness and real pressure/recovery
-   delivery are not established by the simulated tests.
-2. Real macOS libdispatch/sysctl operation. There is no Darwin kernel here.
-   Callback lifetime cleanup is implemented, but actual native runtime behavior
-   remains unverified.
-3. Successful real Linux PSI registration/event delivery. This sandbox exposes
-   no `/proc/pressure/memory`; no privileged or delegated cgroup was supplied.
-4. Real Dask or processkit dependency integration. Neither is installed; package
-   installation was attempted but package-index DNS/network access was
-   unavailable. Their tests are included and skipped explicitly.
-5. Real memory-limit enforcement, deliberately induced pressure, long-duration
-   soak tests, latency/performance characterization, and a full platform matrix.
+1. Real Windows kernel Memory Resource Notification and Job Object behavior.
+2. Real macOS libdispatch/sysctl operation.
+3. Successful real Linux PSI registration/event delivery; this sandbox does not
+   expose `/proc/pressure/memory`.
+4. Real Dask or processkit dependency integration; neither optional dependency is
+   installed in this environment.
+5. Deliberately induced system memory pressure, hard-limit enforcement, long soak
+   tests, notification-latency characterization, or a full platform matrix.
 
-The three reported skips are the native-sensor opt-in test and the two missing-
-optional-dependency test modules. No skipped native test is counted as passed.
-The CI workflow is supplied but was not executed on hosted runners here.
+The three skips are the native-sensor opt-in module and the two missing optional-
+dependency integration modules. No skipped native test is counted as passed.
 
-## Acceptance before deployment
+## Operational interpretation of 0.1.1 changes
 
-Install the intended extras and run the full suite on the target interpreter.
-Enable `RESOURCE_PRESSURE_NATIVE=1` for real initialization/teardown tests.
-Run `resource-pressure doctor` with the exact host/cgroup permissions used by the
-application. Confirm that the reported containment mechanism is the intended
-Job Object or cgroup v2, not a weaker fallback.
+`try_submit_managed()` closes the producer-liveness gap identified in 0.1.0:
+custom coordinators can refuse new work without blocking the code path that
+harvests completed futures. Its lease remains held until explicit result release,
+so a stream of quickly completed but retained results cannot continuously reopen
+capacity.
 
-In disposable VMs, validate OS-generated pressure/recovery transitions and
-process-tree limit/cleanup behavior, including startup under pressure, monitor
-failure, cancelled work, descendant processes, and outer-container budgets.
-Validate Linux stall thresholds against the actual workload; their defaults are
-policy choices, not measured optimum values. Retain Dask's built-in safeguards.
+`min_admission_interval` mitigates, but cannot mathematically eliminate, the
+window between starting memory-heavy work and the operating system reporting
+pressure. It is an explicit fixed pacing control. It does not infer safe worker
+counts, inspect RAM utilization, revoke running tasks, or guarantee prevention of
+OOM from a single large allocation.
+
+## Acceptance before production deployment
+
+Install the intended extras and run the full suite on each target interpreter and
+OS. Enable `RESOURCE_PRESSURE_NATIVE=1` for native initialization/teardown smoke
+tests. Run `resource-pressure doctor` with the exact host/cgroup permissions used
+by the application. Validate real pressure/recovery behavior in disposable VMs,
+including startup under pressure, cancelled work, descendant processes, and
+container limits. Keep Dask's own spill/pause/termination safeguards enabled.

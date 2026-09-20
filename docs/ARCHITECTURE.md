@@ -9,6 +9,7 @@ Linux PSI triggers                                  |
 macOS libdispatch                                   v
          |                              PressureGovernor admission
          +---- PressureEvent ----------> state + fixed in-flight ceiling
+                                         + optional start pacing
                                                     |
                                    +----------------+----------------+
                                    |                                 |
@@ -49,8 +50,11 @@ locks. Create governors inside spawned child processes, not at module import.
 
 Python allocation and operating-system notification latency remain. No decision
 is atomic with arbitrary future allocations; a single task can outgrow memory,
-and a burst can arrive before the next event. The fixed ceiling limits initial
-fan-out but does not estimate what fits.
+and a burst can arrive before the next event. The fixed ceiling limits total
+admission but does not estimate what fits. Optional `min_admission_interval`
+adds a fixed minimum interval between new leases so a large ceiling need not be
+filled instantaneously. It narrows the notification-latency window without
+reading RAM percentages or adapting the ceiling. The default interval is zero.
 
 ## Native details and policy ownership
 
@@ -75,19 +79,38 @@ stable public API, so macOS runtime compatibility needs specific testing.
 
 ## Dask limits
 
-`DaskAdmission.submit` returns a normal Future, with a callback releasing logical
-admission on completion/error/cancellation. It defaults to `pure=False` so two
-independent submissions are not accidentally deduplicated. Passing `pure=True`
-is the caller's choice; each submission still counts as its own logical admission.
-Retries/lost-worker recomputation and Dask cancellation semantics are owned by
-Dask, not overridden by this library.
+`DaskAdmission.submit` preserves the 0.1.0 convenience behavior: it blocks for
+admission, returns a normal Future, and releases logical admission when that
+Future completes/errors/cancels. `try_submit` is the non-blocking counterpart;
+it atomically attempts a governor reservation and returns `None` when pressure,
+capacity, or admission pacing currently prevents submission. Both default to
+`pure=False` and pass all other submission kwargs through to `Client.submit`.
 
-`map_unordered` holds leases until results are consumed and references released.
-A one-element input lookahead detects end-of-input without needing another
-admission. This matters: after the last result, lingering pressure must not make
-an exhausted iterator wait forever. Completed futures drain while pressure
-blocks new inputs. The consumer must close a partially consumed iterator with
-`contextlib.closing`; abandoning a generator is not an explicit cleanup strategy.
+Custom coordinators that keep their own active-future collection should prefer
+`submit_managed` / `try_submit_managed`. These return `ManagedSubmission`, which
+contains the raw Dask Future but deliberately retains the governor lease until
+the caller consumes/persists the result and calls `release()`. This bounds
+completed-but-undrained results, not just unfinished futures. `cancel()` performs
+best-effort Future cancellation/release and drops the logical lease exactly once.
+The raw Future remains available as `.future` for public Dask functions such as
+`distributed.wait`.
+
+This split avoids a producer-liveness trap: a coordinator can attempt
+`try_submit_managed`, receive `None`, and continue draining its existing Futures
+instead of sleeping inside a blocking submit while completed results retain
+memory. If no active Future exists to drain, blocking for one managed admission
+is safe and avoids a spin loop.
+
+`map_unordered` uses the same managed-lifetime principle internally: leases stay
+held until results are consumed and references released. A one-element input
+lookahead detects end-of-input without needing another admission. Completed
+futures drain while pressure blocks new inputs. The consumer must close a
+partially consumed iterator with `contextlib.closing`; abandoning a generator is
+not an explicit cleanup strategy.
+
+Retries/lost-worker recomputation and Dask cancellation semantics are owned by
+Dask, not overridden by this library. Cancellation is logical: already-running
+Python work can continue after the client no longer wants the Future.
 
 The adapter does not know where a task will be scheduled. Host-local producer
 sensing is appropriate for a local cluster, not a claim of cluster-wide health.
@@ -113,7 +136,7 @@ bounded, but task-specific allocations and persistent descendant memory are not
 accounted for by an admission lease. Cgroup limits, delegation, browser
 sandboxing, and service-manager ownership remain deployment responsibilities.
 
-## Explicit exclusions for 0.1.0
+## Explicit exclusions for 0.1.1
 
 No global distributed coordinator; no remote node telemetry transport; no
 adaptive concurrency estimation; no cgroup-v1 fallback; no default PSI-counter

@@ -7,56 +7,42 @@ No `psutil`, RAM percentages, free-memory reserves, per-worker memory estimates,
 or adaptive thread-pool algorithm. No GLib, PyGObject, MSYS2, or compiler is
 needed for the core wheel.
 
-**Version 0.1.0 is an alpha implementation, not a production-validated release.**
-The supplied source and wheel have not been published to PyPI. Use the local
-paths below; the distribution name is not a claim of ownership of a PyPI name.
+**Version 0.1.1 is an alpha implementation, not a production-validated release.**
 See `docs/TEST_REPORT.md` for what actually ran and what remains unverified.
 
 ## Install
 
-Core:
+Core native sensors and admission:
 
 ```bash
 pip install resource-pressure
-```
-or:
-```bash
+# or
 uv add resource-pressure
 ```
-With Dask + process containment:
+
+Dask integration:
+
+```bash
+pip install "resource-pressure[dask]"
+# or
+uv add "resource-pressure[dask]"
+```
+
+Dask + process containment:
 
 ```bash
 pip install "resource-pressure[all]"
-```
-or:
-
-```bash
+# or
 uv add "resource-pressure[all]"
-```
-
-After extracting the archive, from its parent directory:
-
-```bash
-# Core native sensors and admission.
-uv add ./resource-pressure
-
-# Also install Dask and the processkit containment adapter dependencies.
-uv add ./resource-pressure --extra all
 ```
 
 For an editable source checkout:
 
 ```bash
-uv add --editable ./resource-pressure --extra all
+uv add --editable . --extra all
 ```
 
-Or install the supplied universal core wheel:
-
-```bash
-python -m pip install ./resource_pressure-0.1.0-py3-none-any.whl
-```
-
-The wheel itself has no mandatory runtime dependencies. The optional
+The core wheel itself has no mandatory runtime dependencies. The optional
 `containment` extra uses `processkit-py>=1.0,<2`; its own native wheel availability
 and platform restrictions still apply. The `dask` extra installs `distributed`.
 
@@ -66,12 +52,10 @@ and platform restrictions still apply. The `dask` extra installs `distributed`.
 import asyncio
 from resource_pressure import PressureGovernor
 
-
 async def main():
     async with PressureGovernor.auto(max_in_flight=4) as governor:
         async with governor.slot():
             await perform_one_heavy_operation()
-
 
 # asyncio.run(main())  # Define your own perform_one_heavy_operation first.
 ```
@@ -109,6 +93,22 @@ sensor error / closed governor → wake waiters and raise
 Recovery reopens admission to the same ceiling. The package does not kill,
 suspend, shrink, or restart already-running tasks on a pressure transition.
 It does not calculate an optimal worker count.
+
+If a large ceiling could be filled faster than the OS can surface pressure,
+optionally pace new admissions:
+
+```python
+governor = PressureGovernor.auto(
+    max_in_flight=100,
+    min_admission_interval=0.05,  # at most 20 new admissions/second
+)
+```
+
+Pacing is deliberately simple: it is a minimum interval between *new* leases,
+not a RAM estimate, utilization threshold, or adaptive-concurrency controller.
+The default is `0.0` (no pacing), preserving the original low-overhead behavior.
+Use it when individual admissions can allocate substantial memory and native
+pressure notification latency makes instantaneous fan-out undesirable.
 
 For observation without reserving a slot:
 
@@ -157,9 +157,8 @@ eliminated. It is explicit and configurable:
 from resource_pressure import PSIConfig, PressureGovernor
 
 governor = PressureGovernor.auto(
-    psi=PSIConfig(
-        some_stall_us=150_000, full_stall_us=50_000, window_us=2_000_000, quiet_seconds=4.0
-    )
+    psi=PSIConfig(some_stall_us=150_000, full_stall_us=50_000,
+                  window_us=2_000_000, quiet_seconds=4.0)
 )
 ```
 
@@ -167,12 +166,10 @@ Default scope is `/proc/pressure/memory` only. To monitor a deployment-provided
 cgroup and the host, explicitly supply both paths:
 
 ```python
-governor = PressureGovernor.auto(
-    psi_paths=[
-        "/proc/pressure/memory",
-        "/sys/fs/cgroup/YOUR_DELEGATED_GROUP/memory.pressure",
-    ]
-)
+governor = PressureGovernor.auto(psi_paths=[
+    "/proc/pressure/memory",
+    "/sys/fs/cgroup/YOUR_DELEGATED_GROUP/memory.pressure",
+])
 ```
 
 All requested paths must support writable PSI triggers. Merely reading PSI
@@ -207,8 +204,10 @@ cancellation, and queue-barrier cleanup still require actual macOS validation.
 ## Dask
 
 Keep admission in the **producer**, before submitting independent heavy tasks.
-The supplied adapter uses public `Client.submit` and Future APIs, not scheduler
-internals or worker monkey-patches. Keep Dask's existing memory protections.
+The adapter uses public `Client.submit` and Future APIs, not scheduler internals
+or worker monkey-patches. Keep Dask's existing memory protections enabled.
+
+For independent work, `map_unordered()` is the simplest bounded streaming API:
 
 ```python
 from contextlib import closing
@@ -234,17 +233,61 @@ if __name__ == "__main__":
     main()
 ```
 
-`map_unordered` is the recommended bounded streaming interface. It retains at
-most `max_in_flight` submitted futures plus one input lookahead, drains completed
-results even during pressure, and releases futures as results are consumed.
-Closing the iterator cancels/releases the remaining futures and releases leases.
-Large results retained by your application are still your application's memory.
-Input iteration should be cheap; one lookahead can happen while admission is shut.
+`map_unordered()` retains at most `max_in_flight` submitted futures plus one
+input lookahead, drains completed results even while pressure blocks new work,
+and releases futures as results are consumed. Closing the iterator
+cancels/releases remaining futures and leases.
 
-`submit()` and `await asubmit()` return ordinary Dask futures. Their logical lease
-lasts until success, failure, or cancellation. They bound unfinished admitted
-futures, **not** an ever-growing list of completed results retained by the caller.
-Use the streaming API rather than building a giant list of futures.
+### Custom producer loops: do not block the drain path
+
+`submit()` remains a blocking convenience API and returns an ordinary Dask
+Future. For a coordinator that maintains its own `active` set, use the new
+non-blocking managed API instead:
+
+```python
+from collections import deque
+from distributed import wait
+
+queue = deque(items)
+active = {}  # raw Dask Future -> ManagedSubmission
+
+while queue or active:
+    while queue:
+        submission = admitted.try_submit_managed(heavy_task, queue[0])
+        if submission is None:
+            break
+        queue.popleft()
+        active[submission.future] = submission
+
+    if not active:
+        # Nothing exists to drain, so blocking for one admission is safe.
+        submission = admitted.submit_managed(heavy_task, queue.popleft())
+        active[submission.future] = submission
+
+    done, _ = wait(active, return_when="FIRST_COMPLETED")
+    for future in done:
+        submission = active.pop(future)
+        try:
+            result = submission.result()
+            persist_result(result)
+        finally:
+            submission.release()
+```
+
+This matters under memory pressure: if admission closes, the producer does not
+sleep inside a blocking `submit()` while completed futures remain undrained. It
+can keep consuming/releasing existing results, which may itself help memory
+recover.
+
+`try_submit_managed()` also holds its admission lease **after the Dask Future
+finishes**, until `ManagedSubmission.release()` is called. That prevents a fast
+producer from replacing completed-but-retained results indefinitely. Pass
+`submission.future` to Dask APIs such as `wait()`. Use `submission.cancel()` for
+cleanup when abandoning pending work.
+
+For callers that do not retain completed results, `try_submit()` is a lighter
+non-blocking API that returns an ordinary Dask Future and releases its lease on
+Future completion. `submit()` and `await asubmit()` keep their 0.1.0 behavior.
 
 Important boundaries:
 
@@ -252,15 +295,20 @@ Important boundaries:
   remote worker. Multi-host global pressure aggregation is not implemented.
 - It does not resize Dask workers, gate existing queued graphs, cover submissions
   through another client, or govern arbitrary dependent graph nodes.
-- Future cancellation does not guarantee that already-running Python code stops.
-  Thus the bound is on logical admissions, not an inviolable physical-work count
-  after cancellation or worker failure.
+- `max_in_flight` remains a ceiling, not an automatically discovered safe worker
+  count. Optional `min_admission_interval` can narrow the burst window, but no
+  finite pacing value can guarantee that an individual task will not OOM.
+- Future cancellation does not guarantee already-running Python code stops. The
+  bound is on logical admissions, not an inviolable physical-work count after
+  cancellation or worker failure.
 - A completed remote task can retain data. A pressure gate is not proof of freed
   RAM; release results and keep Dask's spill/pause/termination mechanisms enabled.
 
 Never put a blocking governor inside every Dask worker task indiscriminately;
-blocked workers can occupy the very slots needed by dependencies that would
-finish and free memory.
+blocked workers can occupy the slots needed by dependencies that would finish
+and free memory.
+
+See `examples/dask_custom_producer.py` for a complete custom coordinator pattern.
 
 ## Unified containment
 
@@ -294,7 +342,7 @@ requested whole-tree memory/process limits. It is not a security sandbox, and
 session-changing descendants can escape POSIX process groups.
 
 **Only children started through this runner are covered.** Merely constructing a
-group does not contain your existing process, browser, or Dask cluster.
+group does not contain your existing application process, browser, or Dask cluster.
 To contain Dask's hierarchy, launch the supervisor inside a group **before** it
 creates workers. `examples/contained_dask_launcher.py` demonstrates that outer
 boundary; its child runs `examples/dask_local.py` with per-task admission.
@@ -319,7 +367,9 @@ state, and closes it. It does not claim to test containment or induce pressure.
 Missing/failed native support exits with code 2, not a fake NORMAL status.
 
 ```python
-unsubscribe = governor.subscribe(lambda event: print(event.level.name, event.backend, event.reason))
+unsubscribe = governor.subscribe(
+    lambda event: print(event.level.name, event.backend, event.reason)
+)
 # Later: unsubscribe()
 ```
 

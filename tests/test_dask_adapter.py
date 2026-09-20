@@ -158,3 +158,83 @@ def test_async_client_rejected_for_sync_map(normal_governor):
     client.asynchronous = True
     with pytest.raises(TypeError):
         list(DaskAdmission(client, governor).map_unordered(str, [1]))
+
+
+def test_try_submit_returns_none_without_blocking_under_pressure(normal_governor):
+    governor, backend = normal_governor
+    client = Client()
+    adapter = DaskAdmission(client, governor)
+    backend.set_level(PressureLevel.PRESSURED)
+    wait_for_level(governor, PressureLevel.PRESSURED)
+    assert adapter.try_submit(lambda: 1) is None
+    assert not client.futures
+    assert governor.in_flight == 0
+
+
+def test_try_submit_managed_holds_capacity_until_explicit_release(normal_governor):
+    governor, _ = normal_governor
+    client = Client()
+    adapter = DaskAdmission(client, governor)
+
+    first = adapter.try_submit_managed(lambda: 1)
+    second = adapter.try_submit_managed(lambda: 2)
+    assert first is not None and second is not None
+    assert governor.in_flight == 2
+
+    first.future.inner.set_result(1)
+    second.future.inner.set_result(2)
+    # Completion alone does not reopen capacity for managed submissions.
+    assert governor.in_flight == 2
+    assert adapter.try_submit_managed(lambda: 3) is None
+
+    assert first.result() == 1
+    first.release()
+    assert governor.in_flight == 1
+
+    third = adapter.try_submit_managed(lambda: 3)
+    assert third is not None
+    assert governor.in_flight == 2
+    third.cancel()
+    second.release()
+    assert governor.in_flight == 0
+    assert first.future.released
+    assert second.future.released
+    assert third.future.cancel_called
+
+
+def test_try_submit_raw_future_releases_on_completion(normal_governor):
+    governor, _ = normal_governor
+    client = Client()
+    future = DaskAdmission(client, governor).try_submit(lambda: 1)
+    assert future is not None
+    assert governor.in_flight == 1
+    future.inner.set_result(1)
+    assert governor.in_flight == 0
+
+
+def test_managed_submit_preserves_dask_kwargs(normal_governor):
+    governor, _ = normal_governor
+    seen = {}
+
+    class RecordingClient(Client):
+        def submit(self, fn, *args, **kwargs):
+            seen.update(kwargs)
+            return super().submit(fn, *args, **kwargs)
+
+    submission = DaskAdmission(RecordingClient(), governor).try_submit_managed(
+        str,
+        1,
+        key="custom-key",
+        resources={"gpu": 1},
+        priority=7,
+        fifo_timeout="0ms",
+        retries=0,
+    )
+    assert submission is not None
+    assert seen["key"] == "custom-key"
+    assert seen["resources"] == {"gpu": 1}
+    assert seen["priority"] == 7
+    assert seen["fifo_timeout"] == "0ms"
+    assert seen["retries"] == 0
+    assert seen["pure"] is False
+    submission.cancel()
