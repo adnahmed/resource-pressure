@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "resource-pressure"
+version = "0.1.0"
+description = "Native memory-pressure signals, bounded admission, and optional kernel-backed process containment"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+containment = ["processkit-py>=1.0,<2"]
+dask = ["distributed>=2025.1"]
+all = ["processkit-py>=1.0,<2", "distributed>=2025.1"]
+dev = ["pytest>=8", "build>=1", "ruff>=0.11"]
+
+[project.scripts]
+resource-pressure = "resource_pressure.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+resource_pressure = ["py.typed"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = ["native: opt-in native OS integration tests", "integration: optional third-party integration tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

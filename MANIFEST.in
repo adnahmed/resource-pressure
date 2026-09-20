@@ -1,0 +1,10 @@
+include LICENSE README.md CHANGELOG.md SECURITY.md
+recursive-include docs *.md *.txt *.xml
+recursive-include examples *.py
+recursive-include tests *.py
+recursive-include tools *.py
+include .github/workflows/ci.yml
+recursive-include src/resource_pressure py.typed
+prune build
+prune dist
+global-exclude *.pyc *.pyo __pycache__
